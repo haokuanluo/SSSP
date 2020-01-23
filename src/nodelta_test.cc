@@ -39,6 +39,17 @@ enough redundant work that this is faster than removing the vertex from older
 bins.
 [1] Ulrich Meyer and Peter Sanders. "δ-stepping: a parallelizable shortest path
     algorithm." Journal of Algorithms, 49(1):114–152, 2003.
+
+
+We use the length of 1/10 of average edge length as the delta
+we then always make sure there are a good number of items in the bin
+then we are done!
+
+ // update:
+ // think about how to make sure it has enough threads (do you need to change delta to achieve this?)
+ // consider using both spfa and dijkstra
+ // consider dynaically double delta for road graphs.
+
 */
 
 
@@ -46,16 +57,30 @@ using namespace std;
 
 const WeightT kDistInf = numeric_limits<WeightT>::max()/2;
 const size_t kMaxBin = numeric_limits<size_t>::max()/2;
-const int numThreads = 256;
+const int numThreads = 128;
+const int take = 100;
+
+int getEdgeLengthEstimate(const WGraph &g, NodeID source) {
+    int step = g.num_nodes()/take;
+    if (step==0) step=1;
+    long long ans=0,tt=0;
+    for(int i=0;i<g.num_nodes();i+=step)
+        for (WNode wn : g.out_neigh(i)) {
+            ans+=wn.w;
+            tt++;
+        }
+    return (int) ans/tt;
+}
 
 pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
-    Timer t;
+    int avgW = getEdgeLengthEstimate(g,source);
+    delta = avgW/10;
 
+    Timer t;
+    int binSize;
     cout<<delta<<endl;
-    long long weight = 0;
     pvector<WeightT> dist(g.num_nodes(), kDistInf);
     pvector<WeightT> extendedDist(g.num_nodes(), kDistInf);
-    pvector<bool> inq(g.num_nodes(),false);
     dist[source] = 0;
     pvector<NodeID> frontier(g.num_edges_directed());
     // two element arrays for double buffering curr=iter&1, next=(iter+1)&1
@@ -65,21 +90,19 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
     t.Start();
 #pragma omp parallel
     {
-        vector<NodeID>  local_bin;
+        vector<vector<NodeID> > local_bins(0);
         size_t iter = 0;
-        while (frontier_tails[iter&1] != 0) {
-#pragma omp single
-            weight = 0;
+        while (shared_indexes[iter&1] != kMaxBin) {
+            size_t &curr_bin_index = shared_indexes[iter&1];
+            size_t &next_bin_index = shared_indexes[(iter+1)&1];
             size_t &curr_frontier_tail = frontier_tails[iter&1];
             size_t &next_frontier_tail = frontier_tails[(iter+1)&1];
-
 #pragma omp for nowait schedule(dynamic, 64)
             for (size_t i=0; i < curr_frontier_tail; i++) {
                 NodeID u = frontier[i];
-                //inq[u]=0;
                 WeightT old_ext_dist = extendedDist[u];
                 WeightT new_ext_dist = dist[u];
-                if (dist[u] < extendedDist[u]) {
+                if (dist[u] >= delta * static_cast<WeightT>(curr_bin_index) && dist[u] < extendedDist[u]) {
                     extendedDist[u]=dist[u];
                     for (WNode wn : g.out_neigh(u)) {
                         WeightT old_dist = dist[wn.v];
@@ -94,38 +117,55 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
                                 }
                             }
                             if (changed_dist) {
-                                local_bin.push_back(wn.v);
+                                size_t dest_bin = new_dist/delta;
+                                if (dest_bin >= local_bins.size()) {
+                                    local_bins.resize(dest_bin+1);
+                                }
+                                local_bins[dest_bin].push_back(wn.v);
                             }
                         }
                     }
                 }
             }
-            //fetch_and_add(weight,dist[local_bin[local_bin.size()/2]]);
-
-
+            for (size_t i=curr_bin_index; i < local_bins.size(); i++) {
+                if (!local_bins[i].empty()) {
+#pragma omp critical
+                    next_bin_index = min(next_bin_index, i);
+                    break;
+                }
+            }
+            binSize = 0;
 #pragma omp barrier
-//#pragma omp single
-           // weight = weight / omp_get_num_threads();
-
 #pragma omp single nowait
-            curr_frontier_tail = 0;
+            {
+                t.Stop();
+                //PrintStep(curr_bin_index, t.Millisecs(), curr_frontier_tail);
+                t.Start();
+                curr_bin_index = kMaxBin;
+                curr_frontier_tail = 0;
+            }
+            int local_bin_index = next_bin_index;
 
-
-
-            size_t copy_start = fetch_and_add(next_frontier_tail,
-                                              local_bin.size());
-
-            copy(local_bin.begin(),
-                 local_bin.end(), frontier.data() + copy_start);
-            local_bin.resize(0);
-
+            for(int i=next_bin_index;i<next_bin_index+10;i++) {
+                if(i<local_bins.size()) {
+                    size_t copy_start = fetch_and_add(next_frontier_tail,
+                                                      local_bins[i].size());
+                    copy(local_bins[i].begin(),
+                         local_bins[i].end(), frontier.data() + copy_start);
+                    local_bins[i].resize(0);
+                } else break;
+//#pragma omp barrier
+                if (next_frontier_tail > numThreads)break;
+            }
 
             iter++;
 #pragma omp barrier
 
+//#pragma omp single
+//            cout<<next_frontier_tail<<endl;
         }
-        //#pragma omp single
-        //cout << "took " << iter << " iterations" << endl;
+        #pragma omp single
+        cout << "took " << delta << " deltas" << endl;
     }
     return dist;
 }

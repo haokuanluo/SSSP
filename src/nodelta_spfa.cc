@@ -66,19 +66,28 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
 #pragma omp parallel
     {
         vector<NodeID>  local_bin;
+        long long local_weight = 0;
         size_t iter = 0;
+        int dd = 0;
+        int tt=0;
         while (frontier_tails[iter&1] != 0) {
-#pragma omp single
-            weight = 0;
+            local_weight = 0;
+
             size_t &curr_frontier_tail = frontier_tails[iter&1];
             size_t &next_frontier_tail = frontier_tails[(iter+1)&1];
 
 #pragma omp for nowait schedule(dynamic, 64)
             for (size_t i=0; i < curr_frontier_tail; i++) {
                 NodeID u = frontier[i];
+                if (curr_frontier_tail>100 && dist[u]>weight) {
+                    local_bin.push_back(u);
+                    dd++;
+                    continue;
+                }
+                tt++;
                 //inq[u]=0;
-                WeightT old_ext_dist = extendedDist[u];
-                WeightT new_ext_dist = dist[u];
+                //WeightT old_ext_dist = extendedDist[u];
+                //WeightT new_ext_dist = dist[u];
                 if (dist[u] < extendedDist[u]) {
                     extendedDist[u]=dist[u];
                     for (WNode wn : g.out_neigh(u)) {
@@ -104,8 +113,8 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
 
 
 #pragma omp barrier
-//#pragma omp single
-           // weight = weight / omp_get_num_threads();
+#pragma omp single
+            weight = 0;
 
 #pragma omp single nowait
             curr_frontier_tail = 0;
@@ -117,15 +126,22 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
 
             copy(local_bin.begin(),
                  local_bin.end(), frontier.data() + copy_start);
+            for(size_t i=0;i<local_bin.size();i++) local_weight += dist[local_bin[i]];
             local_bin.resize(0);
-
+            fetch_and_add(weight,local_weight);
 
             iter++;
 #pragma omp barrier
+#pragma omp single
+            if(copy_start > 0)weight = weight / next_frontier_tail;
+#pragma omp single
+            cout<<next_frontier_tail<<endl;
 
         }
         //#pragma omp single
         //cout << "took " << iter << " iterations" << endl;
+//#pragma omp critical
+//        cout<<(double) dd/(double)tt<<endl;
     }
     return dist;
 }
