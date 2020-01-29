@@ -6,9 +6,7 @@
 #include <iostream>
 #include <queue>
 #include <vector>
-#include<cstdlib>
 
-#include "omp.h"
 #include "benchmark.h"
 #include "builder.h"
 #include "command_line.h"
@@ -22,13 +20,10 @@
 GAP Benchmark Suite
 Kernel: Single-source Shortest Paths (SSSP)
 Author: Scott Beamer
-
 Returns array of distances for all vertices from given source vertex
-
 This SSSP implementation makes use of the ∆-stepping algorithm [1]. The type
 used for weights and distances (WeightT) is typedefined in benchmark.h. The
 delta parameter (-d) should be set for each input graph.
-
 The bins of width delta are actually all thread-local and of type std::vector
 so they can grow but are otherwise capacity-proportional. Each iteration is
 done in two phases separated by barriers. In the first phase, the current
@@ -37,19 +32,25 @@ they are able to improve, they add them to their thread-local bins. During this
 phase, each thread also votes on what the next bin should be (smallest
 non-empty bin). In the next phase, each thread copies their selected
 thread-local bin into the shared bin.
-
 Once a vertex is added to a bin, it is not removed, even if its distance is
 later updated and it now appears in a lower bin. We find ignoring vertices if
 their current distance is less than the min distance for the bin to remove
 enough redundant work that this is faster than removing the vertex from older
 bins.
-
 [1] Ulrich Meyer and Peter Sanders. "δ-stepping: a parallelizable shortest path
     algorithm." Journal of Algorithms, 49(1):114–152, 2003.
 
-    two ways: 1. a variable to count overall queue size
-    2. one thread to detect if it should quit
-    3. discard the lock: use the same algorithm as the delta stepping
+
+We use the length of 1/10 of average edge length as the delta
+we then always make sure there are a good number of items in the bin
+then we are done!
+
+ // update:
+ // think about how to make sure it has enough threads (do you need to change delta to achieve this?)
+ // consider using both spfa and dijkstra
+ // consider dynaically double delta for road graphs.
+ // two things : first think of optimizing order. then think of optimizing when td!=dist[u];
+
 */
 
 
@@ -57,64 +58,51 @@ using namespace std;
 
 const WeightT kDistInf = numeric_limits<WeightT>::max()/2;
 const size_t kMaxBin = numeric_limits<size_t>::max()/2;
-const int numQueue=100;
+const int numThreads = 128;
+const int take = 6000;
+
+int getEdgeLengthEstimate(const WGraph &g, NodeID source) {
+    int step = g.num_nodes()/take;
+    if (step==0) step=1;
+    long long ans=0,tt=0;
+    for(int i=0;i<g.num_nodes();i+=step)
+        for (WNode wn : g.out_neigh(i)) {
+            ans+=wn.w;
+            tt++;
+        }
+    return (int) ans/tt;
+}
 
 pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
+
     Timer t;
+    int binSize;
+    cout<<delta<<endl;
     pvector<WeightT> dist(g.num_nodes(), kDistInf);
     dist[source] = 0;
-    //pvector<NodeID> frontier(g.num_edges_directed());
-
-    // two element arrays for double buffering curr=iter&1, next=(iter+1)&1
-    //size_t shared_indexes[2] = {0, kMaxBin};
-    //size_t frontier_tails[2] = {1, 0};
-    //frontier[0] = source;
-    int dealing = 1;
 
     typedef pair<WeightT, NodeID> WN;
-    priority_queue<WN, vector<WN>, greater<WN>> mq[numQueue];
-    mq[0].push(make_pair(0, source));
 
-    //queue <NodeID> q;
+    pvector<NodeID> frontier(g.num_edges_directed());
+    // two element arrays for double buffering curr=iter&1, next=(iter+1)&1
+    size_t shared_indexes[2] = {0, kMaxBin};
+    size_t frontier_tails[2] = {1, 0};
+    int total_queue_size = 0;
+    frontier[0] = source;
     t.Start();
-    //q.push(source);
-    //inq[source] = 1;
-    omp_lock_t writelock[numQueue];
-    for(int i=0;i<numQueue;i++)omp_init_lock(&writelock[i]);
-
 #pragma omp parallel
     {
+        priority_queue<WN, vector<WN>, greater<WN>> local_bin;
+        size_t iter = 0;
+        while (frontier_tails[iter&1] != 0) {
 
-        while(1) {
-            bool cont = 0;
-            if (dealing == 0)break; // requires dealing++ before q.pop
-            //cout<<dealing<<endl;
-
-            NodeID u=0;
-            WeightT td = 0;
-            int qID = rand()%numQueue;
-            omp_set_lock(&writelock[qID]);
-            {
-
-                if (!mq[qID].empty()) {
-
-                    td = mq[qID].top().first;
-                    u = mq[qID].top().second;
-                    mq[qID].pop();
-
-                    //u=q.front();
-                    //q.pop();
-                    //inq[u]=0; // make sure to modify dist before modify inq in the later section
-                    cont=1;
-                } else cont = 0;
-
-            };
-            omp_unset_lock(&writelock[qID]);
-            if (!cont) {
-                continue;
-            }
-
-            if(td == dist[u])for (WNode wn : g.out_neigh(u)) {
+            size_t &curr_frontier_tail = frontier_tails[iter&1];
+            size_t &next_frontier_tail = frontier_tails[(iter+1)&1];
+#pragma omp for nowait schedule(dynamic, 64)
+            for (size_t i=0; i < curr_frontier_tail; i++) {
+                NodeID u = frontier[i];
+                // requires to check if dist[u]==queue.second when calculating frontier
+                for (WNode wn : g.out_neigh(u)) {
                     WeightT old_dist = dist[wn.v];
                     WeightT new_dist = dist[u] + wn.w;
                     if (new_dist < old_dist) {
@@ -127,23 +115,61 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
                             }
                         }
                         if (changed_dist) {
-                            int qID  = rand()%numQueue;
-                            omp_set_lock(&writelock[qID]);
-                            mq[qID].push(make_pair(new_dist, wn.v));
-                            fetch_and_add(dealing,1);
-                            omp_unset_lock(&writelock[qID]);
-
+                            local_bin.push(make_pair(new_dist, wn.v));
                         }
                     }
                 }
-            fetch_and_add(dealing,-1);
 
+            }
+            /*
+            for (size_t i=curr_bin_index; i < local_bins.size(); i++) {
+                if (!local_bins[i].empty()) {
+#pragma omp critical
+                    next_bin_index = min(next_bin_index, i);
+                    break;
+                }
+            }
+             */
+            fetch_and_add(total_queue_size,local_bin.size());
+#pragma omp barrier
+#pragma omp single nowait
+            {
+                curr_frontier_tail = 0;
+            }
+            if(total_queue_size==0)break;
+            int numEle = take*local_bin.size()/total_queue_size;
+
+
+            if(numEle > local_bin.size())numEle = local_bin.size();
+
+            vector<NodeID> lb;
+            NodeID u=0;
+            WeightT td = 0;
+            for(int i=0;i<numEle;i++) {
+                td = local_bin.top().first;
+                u = local_bin.top().second;
+                local_bin.pop();
+                if (td == dist[u])lb.push_back(u);
+            }
+//#pragma omp critical
+  //          cout<<lb.size()<<' ';
+            size_t copy_start = fetch_and_add(next_frontier_tail,lb.size());
+            copy(lb.begin(),
+                 lb.end(), frontier.data() + copy_start);
+
+
+
+            iter++;
+#pragma omp barrier
+#pragma omp single
+            total_queue_size = 0;
+
+//#pragma omp single
+//            cout<<next_frontier_tail<<endl;
         }
-    };
-    for(int i=0;i<numQueue;i++)omp_destroy_lock(&writelock[i]);
-
-
-
+#pragma omp single
+        cout << "took " << delta << " deltas" << endl;
+    }
     return dist;
 }
 
