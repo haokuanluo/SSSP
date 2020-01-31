@@ -49,9 +49,9 @@ then we are done!
  // think about how to make sure it has enough threads (do you need to change delta to achieve this?)
  // consider using both spfa and dijkstra
  // consider dynaically double delta for road graphs.
-  // you can devide the process by several iterations, therefore achieving good ordering
- //add extended dist
- // you should totally do that: compare local heap's best node to what the assigned job is, and do the local first if better!
+ // two things : first think of optimizing order. then think of optimizing when td!=dist[u];
+ // now consider preventing the program from wasting too much time on a bad node
+ // problem: unbalanced!
 
 */
 
@@ -62,7 +62,8 @@ const WeightT kDistInf = numeric_limits<WeightT>::max()/2;
 const size_t kMaxBin = numeric_limits<size_t>::max()/2;
 const int numThreads = 128;
 const int take = 6000;
-const int iterations = 10;
+const int iterations = 1;
+const int limi = 1; // 1 to 10 not much difference
 
 int getEdgeLengthEstimate(const WGraph &g, NodeID source) {
     int step = g.num_nodes()/take;
@@ -82,16 +83,18 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
     int binSize;
     cout<<delta<<endl;
     pvector<WeightT> dist(g.num_nodes(), kDistInf);
+    //pvector<WeightT> extendedDist(g.num_nodes(), kDistInf);
+
     dist[source] = 0;
 
     typedef pair<WeightT, NodeID> WN;
 
-    pvector<WN> frontier(g.num_edges_directed());
+    pvector<NodeID> frontier(g.num_edges_directed());
     // two element arrays for double buffering curr=iter&1, next=(iter+1)&1
     size_t shared_indexes[2] = {0, kMaxBin};
     size_t frontier_tails[2] = {1, 0};
     int total_queue_size = 0;
-    frontier[0] = make_pair(0,source);
+    frontier[0] = source;
     t.Start();
 #pragma omp parallel
     {
@@ -103,27 +106,59 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
             size_t &next_frontier_tail = frontier_tails[(iter+1)&1];
 #pragma omp for nowait schedule(dynamic, 64)
             for (size_t i=0; i < curr_frontier_tail; i++) {
-                NodeID u = frontier[i].second;
-                //WeighT w = frontier[i].first;
+                NodeID assignedU = frontier[i];
+
 
                 // requires to check if dist[u]==queue.second when calculating frontier
-                for (WNode wn : g.out_neigh(u)) {
-                    WeightT old_dist = dist[wn.v];
-                    WeightT new_dist = dist[u] + wn.w;
-                    if (new_dist < old_dist) {
-                        bool changed_dist = true;
-                        while (!compare_and_swap(dist[wn.v], old_dist, new_dist)) {
-                            old_dist = dist[wn.v];
-                            if (old_dist <= new_dist) {
-                                changed_dist = false;
-                                break;
+                int ct = 0;
+                while(ct < limi && (!local_bin.empty()) && local_bin.top().first < dist[assignedU]) {
+                    ct++;
+                    NodeID u = local_bin.top().second;
+                    WeightT dt = local_bin.top().first;
+                    local_bin.pop();
+                    if (dt == dist[u] ) {
+                        //extendedDist[u]=dist[u];
+                        for (WNode wn : g.out_neigh(u)) {
+                            WeightT old_dist = dist[wn.v];
+                            WeightT new_dist = dist[u] + wn.w;
+                            if (new_dist < old_dist) {
+                                bool changed_dist = true;
+                                while (!compare_and_swap(dist[wn.v], old_dist, new_dist)) {
+                                    old_dist = dist[wn.v];
+                                    if (old_dist <= new_dist) {
+                                        changed_dist = false;
+                                        break;
+                                    }
+                                }
+                                if (changed_dist) {
+                                    local_bin.push(make_pair(new_dist, wn.v));
+                                }
                             }
-                        }
-                        if (changed_dist) {
-                            local_bin.push(make_pair(new_dist, wn.v));
                         }
                     }
                 }
+                NodeID u = assignedU;
+                if(1) {
+                    //extendedDist[u]=dist[u];
+                    for (WNode wn : g.out_neigh(u)) {
+                        WeightT old_dist = dist[wn.v];
+                        WeightT new_dist = dist[u] + wn.w;
+                        if (new_dist < old_dist) {
+                            bool changed_dist = true;
+                            while (!compare_and_swap(dist[wn.v], old_dist, new_dist)) {
+                                old_dist = dist[wn.v];
+                                if (old_dist <= new_dist) {
+                                    changed_dist = false;
+                                    break;
+                                }
+                            }
+                            if (changed_dist) {
+                                local_bin.push(make_pair(new_dist, wn.v));
+                            }
+                        }
+                    }
+                }
+
 
             }
             /*
@@ -147,19 +182,18 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
 
             if(numEle > local_bin.size())numEle = local_bin.size();
 
-            vector<WN> lb;
+            vector<NodeID> lb;
             NodeID u=0;
             WeightT td = 0;
             for(int i=0;i<numEle;i++) {
-                WN node = local_bin.top();
+                td = local_bin.top().first;
+                u = local_bin.top().second;
                 local_bin.pop();
-                td = node.first;
-                u = node.second;
-
-                if (td == dist[u])lb.push_back(node);
+                if (td == dist[u])lb.push_back(u);
             }
 //#pragma omp critical
             //          cout<<lb.size()<<' ';
+#pragma omp barrier
             int step = lb.size()/iterations;
             for(int i=0;i<iterations;i++) {
                 int start = i*step;
@@ -173,12 +207,10 @@ pvector<WeightT> DeltaStep(const WGraph &g, NodeID source, WeightT delta) {
 
 
 
-
             iter++;
 #pragma omp barrier
 #pragma omp single
             total_queue_size = 0;
-
 
 //#pragma omp single
 //            cout<<next_frontier_tail<<endl;
